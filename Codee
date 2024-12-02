@@ -1,0 +1,352 @@
+#include <Arduino.h>
+#if defined(ESP32)
+#include <WiFi.h>
+#elif defined(ESP8266)
+#include <ESP8266WiFi.h>
+#endif
+#include <Firebase_ESP_Client.h>
+#include "DHT.h"
+#include <HTTPClient.h>
+#include <LiquidCrystal_I2C.h>
+
+
+int lcdColumns = 16;
+int lcdRows = 2;
+LiquidCrystal_I2C lcd(0x27, lcdColumns, lcdRows);
+
+//Provide the token generation process info.
+#include "addons/TokenHelper.h"
+//Provide the RTDB payload printing info and other helper functions.
+#include "addons/RTDBHelper.h"  // Real Time DataBase
+
+#define WIFI_SSID "ahmed"
+#define WIFI_PASSWORD "00000000"
+
+// Insert Firebase project API Key
+#define API_KEY "AIzaSyBrDQEHFfJmwueg4rlaCzuP6BN9eyYUS_8"
+
+// Insert RTDB URLefine the RTDB URL */
+#define DATABASE_URL "https://mennah-cf39e-default-rtdb.firebaseio.com/"
+
+#define FIREBASE_PROJECT_ID "mennah-cf39e"
+
+FirebaseData fbdoS;
+FirebaseData fbdoC;
+FirebaseData fbdoSD;
+FirebaseData fbdoCD;
+FirebaseData fbdoT;
+FirebaseData fbdoH;
+FirebaseData fbdoCoG;
+FirebaseData fbdoCoR;
+FirebaseData fbdoCoB;
+FirebaseData fdata;
+FirebaseJson json;
+
+
+FirebaseAuth auth; // authntication
+FirebaseConfig config;    // configuration
+
+unsigned long sendDataPrevMillis = 0;
+bool signupOK = false;
+
+// DHT Sensor setup
+#define DHTPIN 5
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+
+// Gas sensors
+const int MQ2_PIN = 34;
+const int MQ2_Digital = 13;
+const int MQ135_PIN = 35;
+const int MQ135_Digital = 15;
+
+int mq2_state = 0;
+int mq135_state = 0;
+// Calibration baseline (Ro) values for each sensor in clean air
+float Ro_MQ2 = 0;
+float Ro_MQ135 = 0;
+
+//float humidity = 0;
+//float temperatureC = 0;
+//float analogValue_MQ2 = 0;
+//float smokePPM_MQ2 = 0;
+//float analogValue_MQ6 = 0;
+//float methanePPM_MQ6 = 0;
+//float analogValue_MQ135 = 0;
+//float smokePPM_MQ135 = 0;
+
+// Sensor response curves
+const float MQ2_CURVE[3] = {2.3, 0.53, -0.44};    // MQ-2 for smoke
+const float MQ135_CURVE[3] = {2.6, 0.5, -0.42};   // MQ-135 for smoke
+
+#define S2 4 /*Define S2 Pin Number of ESP32*/
+#define S3 17 /*Define S3 Pin Number of ESP32*/
+#define sensorOut 16 /*Define Sensor Output Pin Number of ESP32*/
+int R_Min = 18;  /*Red minimum value*/
+int R_Max = 128; /*Red maximum value*/
+int G_Min = 18;  /*Green minimum value*/
+int G_Max = 133; /*Green maximum value*/
+int B_Min = 15;  /*Blue minimum value*/
+int B_Max = 115; /*Blue maximum value*/
+
+/*Define int variables*/
+int Red = 0;
+int Green = 0;
+int Blue = 0;
+
+int redValue;
+int greenValue;
+int blueValue;
+int Frequency;
+
+
+// Calibration function for gas sensors
+float calibrateSensor(int pin) {
+  float total = 0;
+  int numReadings = 100;
+  for (int i = 0; i < numReadings; i++) {
+    total += getAnalogValue(pin);
+    delay(100);
+  }
+  return total / numReadings;  // Average reading in clean air
+}
+
+
+void setup() {
+  Serial.begin(115200);
+
+  lcd.init();
+  lcd.clear();
+  lcd.backlight();
+
+  pinMode (MQ2_Digital, OUTPUT);
+  pinMode (MQ135_Digital, OUTPUT);
+  pinMode(S2, OUTPUT);        /*Define S2 Pin as a OUTPUT*/
+  pinMode(S3, OUTPUT);        /*Define S3 Pin as a OUTPUT*/
+  pinMode(sensorOut, INPUT);  /*Define Sensor Output Pin as a INPUT*/
+
+  // Calibrate each sensor in clean air
+  Serial.println("Calibrating sensors in clean air...");
+  Ro_MQ2 = calibrateSensor(MQ2_PIN);
+  Serial.print("MQ2 Ro (clean air): ");
+  Serial.println(Ro_MQ2);
+
+  Ro_MQ135 = calibrateSensor(MQ135_PIN);
+  Serial.print("MQ135 Ro (clean air): ");
+  Serial.println(Ro_MQ135);
+
+  dht.begin();
+  Serial.println("Calibration complete.\n");
+
+  delay(2000);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(300);
+  }
+  Serial.println();
+  Serial.print("Connected with IP: ");
+  Serial.println(WiFi.localIP());
+  Serial.println();
+
+  /* Assign the api key (required) */
+  config.api_key = API_KEY;
+
+  /* Assign the RTDB URL (required) */
+  config.database_url = DATABASE_URL;
+
+  /* Sign up */
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("ok");
+    signupOK = true;
+  }
+  else {
+    Serial.printf("%s\n", config.signer.signupError.message.c_str());
+  }
+
+  /* Assign the callback function for the long running token generation task */
+  config.token_status_callback = tokenStatusCallback; //see addons/TokenHelper.h
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+
+
+}
+
+void writeLCD(float temp, float humidity, int mq2_state, int mq135_state) {
+  lcd.setCursor(1, 0);
+  lcd.print("Temp: ");
+  lcd.print(temp);
+  lcd.print(" ");  // Fixed missing semicolon
+  lcd.print("Hum: ");
+  lcd.print(humidity);
+
+  lcd.setCursor(1, 1);
+  lcd.print("MQ2: ");
+  lcd.print(mq2_state);
+  lcd.print(" ");  // Fixed missing semicolon
+  lcd.print("MQ135: ");
+  lcd.print(mq135_state);
+
+  delay(2000);
+  lcd.clear();
+}
+
+float getAnalogValue(int pin) {
+  return analogRead(pin);
+}
+
+// Concentration calculation for each sensor
+float calculateConcentration(float analogValue, float Ro_value, const float curve[3]) {
+  float ratio = Ro_value / analogValue;  // Inverse ratio since analog value drops with gas
+  return pow(10, ((log10(ratio) - curve[1]) / curve[2]) + curve[0]);
+}
+
+void uploadDocument(float humidity, float temp, float smoke_conc, float carbon, int mq2_state, int mq135_state) {
+  // Create a unique ID for the document (optional; Firestore can generate one automatically)
+  String documentId = String(millis()); // Use the current time in milliseconds as the document ID
+
+  // Set fields with correct Firestore types
+  json.set("fields/humidity/doubleValue", humidity);
+  json.set("fields/temp/doubleValue", temp);
+  json.set("fields/smoke/doubleValue", smoke_conc);
+  json.set("fields/carbon/doubleValue", carbon);
+  json.set("fields/mq2_state/integerValue", mq2_state);
+  json.set("fields/mq135_state/integerValue", mq135_state);
+
+  // Send the data to Firestore
+  if (Firebase.Firestore.createDocument(&fdata, FIREBASE_PROJECT_ID, "", "sensors/" + documentId, json.raw())) {
+    Serial.println("New document created successfully!");
+  } else {
+    Serial.println("Error creating new document: " + fdata.errorReason());
+  }
+}
+int getRed() {
+  digitalWrite(S2, LOW);
+  digitalWrite(S3, LOW);
+  Frequency = pulseIn(sensorOut, LOW); /*Get the Red Color Frequency*/
+  if (Frequency <= 0) {
+    return 0;
+  } else {
+    return Frequency;
+  }
+}
+
+int getGreen() {
+  digitalWrite(S2, HIGH);
+  digitalWrite(S3, HIGH);
+  Frequency = pulseIn(sensorOut, LOW); /*Get the Green Color Frequency*/
+  if (Frequency <= 0) {
+    return 0;
+  } else {
+    return Frequency;
+  }
+}
+
+int getBlue() {
+  digitalWrite(S2, LOW);
+  digitalWrite(S3, HIGH);
+  Frequency = pulseIn(sensorOut, LOW); /*Get the Blue Color Frequency*/
+  if (Frequency <= 0) {
+    return 0;
+  } else {
+    return Frequency;
+  }
+}
+
+void loop() {
+  // Read DHT sensor
+  float humidity = dht.readHumidity();
+  float temperatureC = dht.readTemperature();
+
+  // Read MQ2 sensor for smoke
+  float analogValue_MQ2 = getAnalogValue(MQ2_PIN);
+  float smokePPM_MQ2 = calculateConcentration(analogValue_MQ2, Ro_MQ2, MQ2_CURVE);
+  mq2_state = !digitalRead(MQ2_Digital);
+
+  // Read MQ135 sensor for smoke
+  float analogValue_MQ135 = getAnalogValue(MQ135_PIN);
+  float smokePPM_MQ135 = calculateConcentration(analogValue_MQ135, Ro_MQ135, MQ135_CURVE);
+  mq135_state = !digitalRead(MQ135_Digital);
+
+  Red = getRed();
+  redValue = map(Red, R_Min, R_Max, 255, 0); /*Map the Red Color Value*/
+  delay(200);
+
+  Green = getGreen();
+  greenValue = map(Green, G_Min, G_Max, 255, 0); /*Map the Green Color Value*/
+  delay(200);
+
+  Blue = getBlue();
+  blueValue = map(Blue, B_Min, B_Max, 255, 0); /*Map the Blue Color Value*/
+  delay(200);
+
+  writeLCD(temperatureC, humidity, mq2_state, mq135_state);
+
+  if (Firebase.ready() && signupOK && (millis() - sendDataPrevMillis > 1000 || sendDataPrevMillis == 0)) {
+    sendDataPrevMillis = millis();
+    if (Firebase.RTDB.setInt(&fbdoS, "air/smoke", smokePPM_MQ2)) {
+      Serial.println ("sent");
+    }    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdoS.errorReason());
+    }
+    if (Firebase.RTDB.setInt(&fbdoSD, "air/is_smoke", mq2_state)) {
+      Serial.println ("sent");
+    }    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdoSD.errorReason());
+    }
+    if (Firebase.RTDB.setInt(&fbdoC, "air/carbon", smokePPM_MQ135)) {
+      Serial.println ("sent");
+    }    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdoC.errorReason());
+    }
+    if (Firebase.RTDB.setInt(&fbdoCD, "air/is_carbon", mq135_state)) {
+      Serial.println ("sent");
+    }    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdoCD.errorReason());
+    }
+    if (Firebase.RTDB.setInt(&fbdoH, "dht/humidity", humidity)) {
+      Serial.println ("sent");
+    }    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdoH.errorReason());
+    }
+    if (Firebase.RTDB.setInt(&fbdoT, "dht/temp", temperatureC)) {
+      Serial.println ("sent");
+    }    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdoT.errorReason());
+    }
+
+    if (Firebase.RTDB.setInt(&fbdoCoR, "color/red", redValue)) {
+      Serial.println ("sent");
+    }    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdoCoR.errorReason());
+    }
+
+    if (Firebase.RTDB.setInt(&fbdoCoG, "color/green", greenValue)) {
+      Serial.println ("sent");
+    }    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdoCoG.errorReason());
+    }
+    if (Firebase.RTDB.setInt(&fbdoCoB, "color/blue", blueValue)) {
+      Serial.println ("sent");
+    }    else {
+      Serial.println("FAILED");
+      Serial.println("REASON: " + fbdoCoB.errorReason());
+    }
+
+    uploadDocument(humidity, temperatureC, smokePPM_MQ2, smokePPM_MQ135, mq2_state, mq135_state);
+
+  }
+
+}
